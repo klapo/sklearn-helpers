@@ -33,6 +33,11 @@ class NormalizeColumnModality(
     X_means_ : float
         Mean of each column after weighting. Used to center a column in :meth:`fit`.
 
+    NOTE: in the original french paper on FAMD, it appears that the actual
+    mathematical operations were "lost in translation". This needs to be
+    re-examined prior to any official publication of the code.
+    http://archive.numdam.org/article/RSA_2004__52_4_93_0.pdf
+
     """
     def __init__(self, center=True, accept_sparse=False):
         self.center = center
