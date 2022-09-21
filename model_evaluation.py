@@ -7,26 +7,123 @@ from sklearn.model_selection import learning_curve
 from sklearn.model_selection import ShuffleSplit
 
 
-def tat_evaluation_dataset(results, models_to_plot, rank_var=None):
-    '''For the input models, select the best ranked configuration for each
-    and concatenate together.
+def gridsearch_results_to_xarray(df, dim_reduction_list=None, scorers=None):
+    """Convert sklearn gridsearch results to an xarray dataset.
+
+    Apparent gaps in the rank of a score are a result of multiple
+    combinations generating identical scores -- the rank of a metric is not
+    guaranteed to have unique values and cannot be reliably used as a
+    dimension for labeling the data.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame returned from a gridsearch (e.g., pd.DataFrame(
+        search.cv_results_))
+    dim_reduction_list : list of strings
+        Dimensionality reduction methods used in the pipeline. These pipeline
+        steps/steps that have passthrough as an option require special
+        handling.
+    scorers : list of strings
+        Scoring methods used in the sklearn grid search.
+    Returns
+    -------
+    ds : xarray.Dataset
+        Contains the formatted grid search results as an xarray Dataset. The
+        dimensions are index (gridsearch iteration), cross-validation split,
+        and the original 1d data labels. Data variables are the fit times,
+        split scores, predicted and observed target variables, and train vs
+        test scores. If dim_reduction_list was passed, there will be a
+        variable describing which method was used in the best-performing model.
+    """
+
+    if dim_reduction_list is None:
+        dim_reduction_list = []
+    dim_red_fill = [None]
+
+    if scorers is None:
+        score_dim = 'rank_test_score'
+        scorers = ['test']
+    else:
+        score_dim = ['rank_test_' + s for s in scorers]
+
+    ds = xr.Dataset.from_dataframe(df)
+    dv_to_dim = [dv for dv in ds.data_vars if 'param_' in dv]
+    dv_to_dim.extend(score_dim)
+    ds = ds.set_coords(dv_to_dim).drop(['params'])
+
+    # param_rename = {p: p.replace('param_', '') for p in ds.coords if 'param_' in p}
+    # ds = ds.rename(param_rename)
+
+    for score in scorers:
+        list_splits = [datavar for datavar in ds.data_vars if 'split' in
+                       datavar and score in datavar]
+        var_splits = [split for split in ds.reset_coords()[list_splits].values()]
+
+        ds['split_test_{}'.format(score)] = xr.DataArray(
+            var_splits,
+            dims=['split', 'index'],
+            coords={
+                'split': np.arange(0, len(list_splits)),
+                'index': ds['index'],
+            }
+        )
+        ds = ds.drop(list_splits)
+
+    ''' Parameters that identify steps that are turned on or off can be
+    identified by not having a double-underscore. The data model from the
+    results dictionary has confusing logic that it is nan when it used and
+    "passthrough" when it not used. This creates two issues: (1) it is a
+    mixed data type that doesn't play well with conversions to better data
+    models like pandas and xarray. (2) a value of nan is not intuitive for a
+    True value.
+
+    Both of these issues are fixed below, but note it uses some janky logic
+    that may break.
     '''
+    identifier_vars = [c for c in ds.coords if '__' not in c and 'param_' in c]
+    for idv in identifier_vars:
+        ds[idv] = xr.where(ds[idv]=='passthrough', False, True)
+
+    # Variable indicating which dim reduction was used
+    ds['dim_reduction'] = (('index'), dim_red_fill * len(ds['index']))
+
+    for dr in dim_reduction_list:
+        if 'No dim reduction' not in dr:
+            dim_red_param_name = 'param_' + dr
+            ds['dim_reduction'] = xr.where(ds[dim_red_param_name]==True, dr,
+                                           ds['dim_reduction'])
+
+    # Handle the case with no dimensionality reduction
+    ds['dim_reduction'] = xr.where(
+        ds['dim_reduction'] == dim_red_fill,
+        'No dim reduction',
+        ds['dim_reduction']
+    )
+
+    return ds
+
+
+def tat_evaluation_dataset(results, models_to_plot, rank_var=None):
+    """For the input models, select the best ranked configuration for each
+    and concatenate together.
+    """
     if rank_var is None:
         rank_var = 'rank_test_R2'
-    
+
     ds_combined = xr.Dataset()
     model_config = []
     for run_name, model_name in models_to_plot.items():
         # Select the best ranked model iteration.
         model_config.append(model_name)
         ds_plot = results[run_name]
-        
+
         # Model configurations can be degenerate. Force return a single
         # model configuration.
         ds_plot = ds_plot.where(
             ds_plot[rank_var]==1, drop=True).reset_coords().isel(index=0)
         # ds_plot = ds_plot.squeeze('index')
-        
+
         # Select the variables to pass on.
         ds_plot = ds_plot[
             [
@@ -37,7 +134,7 @@ def tat_evaluation_dataset(results, models_to_plot, rank_var=None):
                 'split_test_MAPE', 'R2_train', 'MAPE_train',
             ]
         ]
-        
+
         # This variable indicates the model configuration and train/test split
         # for each job. Useful for the concatenated result.
         ds_plot['model, split'] = (
@@ -50,11 +147,11 @@ def tat_evaluation_dataset(results, models_to_plot, rank_var=None):
     return(ds_combined)
 
 
-def tat_eval_scatterplot(results, models_to_plot, suptitle=None, 
+def tat_eval_scatterplot(results, models_to_plot, suptitle=None,
                          rank_var=None, fig_axes=None, sns_kwargs=None):
     if suptitle is None:
         suptitle = 'Predicted TATs from best estimator from GridSearchCV'
-    
+
     ds_combined = tat_evaluation_dataset(
         results, models_to_plot, rank_var=rank_var
     )
@@ -63,12 +160,12 @@ def tat_eval_scatterplot(results, models_to_plot, suptitle=None,
     else:
         fig = fig_axes[0]
         axes = fig_axes[1]
-    
+
     if sns_kwargs is None:
         sns_kwargs = {}
     sns_kwargs['s'] = sns_kwargs.get('s', 20)
     sns_kwargs['palette'] = sns_kwargs.get('palette', 'Paired')
-    
+
     ax = axes[0]
     sns.scatterplot(
         data=ds_combined.to_dataframe(),
@@ -101,7 +198,7 @@ def tat_eval_scatterplot(results, models_to_plot, suptitle=None,
     ax.axhline(0, color='0.5', ls='--')
     ax.set_ylabel('Predicted bias (%)')
     ax.set_xlabel('Observed TAT (hours)')
-    
+
     # lots and lots of assumptions in these quantities
     font_size = sns.plotting_context()['font.size']
     if font_size > 14:
@@ -128,7 +225,7 @@ def tat_eval_scatterplot(results, models_to_plot, suptitle=None,
 
     fig.suptitle(suptitle)
     fig.tight_layout()
-    
+
     return ds_combined
 
 
@@ -138,7 +235,7 @@ def melt_model_results(results, models_to_plot, eval_vars=None):
 
     if eval_vars is None:
         eval_vars = ['R2', 'MAPE']
-    
+
     df_combined = pd.DataFrame()
     for nvar, eval_var in enumerate(eval_vars):
         df_var = df[
@@ -159,7 +256,7 @@ def melt_model_results(results, models_to_plot, eval_vars=None):
         # run is pased in, we add the dimension back.
         if 'mode_config' not in df_var.coords:
             df_var.coords['model_config'] = ds_combined.model_config
-        
+
         df_var = df_var.to_dataframe()
         df_var = df_var.reset_index().melt(
             id_vars=['model_config'],
@@ -185,13 +282,13 @@ def barcharts(results, models_to_plot, suptitle=None, fig_axes=None):
     if suptitle is None:
         suptitle = 'Comparison of cross validation '
     df_combined = melt_model_results(results, models_to_plot, eval_vars=None)
-    
+
     if fig_axes is None:
         fig, axes = plt.subplots(1, 2, figsize=(20, 5))
     else:
         fig = fig_axes[0]
         axes = fig_axes[1]
-    
+
     sns.barplot(
         ax=axes[0],
         data=df_combined,
@@ -210,7 +307,7 @@ def barcharts(results, models_to_plot, suptitle=None, fig_axes=None):
     axes[1].set_ylim(0, 1)
     fig.tight_layout()
     fig.suptitle(suptitle, y=1.01)
-    
+
     return df_combined
 
 
@@ -220,7 +317,7 @@ def cv_splits(results, models_to_plot, rank_var=None, eval_vars=None):
     if eval_vars is None:
         eval_vars = ['R2', 'MAPE']
     num_subplots = len(eval_vars)
-    
+
     fig, axes = plt.subplots(
         num_subplots, 1,
         figsize=(5 * num_subplots, 10), sharex=True)
@@ -241,7 +338,7 @@ def cv_splits(results, models_to_plot, rank_var=None, eval_vars=None):
                 ax.legend()
 
     fig.tight_layout()
-    
+
 
 def plot_learning_curve(
     estimator,
@@ -256,7 +353,12 @@ def plot_learning_curve(
     train_sizes=np.linspace(0.1, 1.0, 5),
 ):
     """
-    Generate test and training learning curves. Directly lifted from sklearn's examples.
+    Generate test and training learning curves. Directly lifted from
+    sklearn's examples (https://scikit-learn.org/stable/auto_examples
+    /model_selection/plot_learning_curve.html). All license requirements (
+    BSD) from sklearn apply to this code.
+
+    Small changes were made for convenience.
 
     Parameters
     ----------
@@ -322,7 +424,7 @@ def plot_learning_curve(
         'neg_mean_absolute_percentage_error': 'mean abs error (%)',
         'r2': 'correlation (-)'
     }
-    
+
     if ax is None:
         fig, ax = plt.subplots(1, 1, figsize=(5, 5))
 
@@ -379,5 +481,5 @@ def plot_learning_curve(
         train_sizes, test_scores_mean, "o-", color="g", label="Cross-validation score"
     )
     ax.legend(loc="best")
-    
+
     return plt, [train_sizes, train_scores_mean, train_scores_std, test_scores_mean, test_scores_std]
