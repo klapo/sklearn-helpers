@@ -4,38 +4,46 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import learning_curve
-from sklearn.model_selection import ShuffleSplit
 
 
 def gridsearch_results_to_xarray(df, dim_reduction_list=None, scorers=None):
-    """Convert sklearn gridsearch results to an xarray dataset.
+    """Convert sklearn.gridsearch results into xarray format.
 
-    Apparent gaps in the rank of a score are a result of multiple
-    combinations generating identical scores -- the rank of a metric is not
-    guaranteed to have unique values and cannot be reliably used as a
-    dimension for labeling the data.
+    Parameters that identify steps that are turned on or off can be identified by
+    not having a double-underscore. The data model from the results dictionary has
+    confusing logic that it is nan when it used and "passthrough" when it not used.
+    This creates two issues:
+        (1) it is a mixed data type that doesn't play well with conversions to better
+        data models like pandas and xarray.
+        (2) a value of nan is not inuitive for a True value.
+
+    Both of these issues are fixed in this function, but note it uses some janky logic
+    that may break when used outside the intended use case of dimensionality reduction
+    with "passthrough" as a possible hyperparameter selection.
+
+    Apparent gaps in the rank of a score are a result of multiple combinations generating
+    identical scores -- the rank of a metric are not unique values and cannot be reliably
+    used as a dimension for labeling the data.
 
     Parameters
     ----------
-    df : pandas.DataFrame
-        DataFrame returned from a gridsearch (e.g., pd.DataFrame(
-        search.cv_results_))
+    df : pandas DataFrame
+        Result from pandas.DataFrame(search.cv_results_)
     dim_reduction_list : list of strings
-        Dimensionality reduction methods used in the pipeline. These pipeline
-        steps/steps that have passthrough as an option require special
-        handling.
+        Names of the dimensionality reduction step. Can be also used for other passthrough
+        pipeline steps, but would require a minor refactor.
     scorers : list of strings
-        Scoring methods used in the sklearn grid search.
+        Names of the scorers used in the grid search.
     Returns
-    -------
-    ds : xarray.Dataset
-        Contains the formatted grid search results as an xarray Dataset. The
-        dimensions are index (gridsearch iteration), cross-validation split,
-        and the original 1d data labels. Data variables are the fit times,
-        split scores, predicted and observed target variables, and train vs
-        test scores. If dim_reduction_list was passed, there will be a
-        variable describing which method was used in the best-performing model.
+    ----------
+    ds : xarray Dataset
+        Dimensions given by grid search index and data label (assumes 1D data).
+        Variables are the grid_search results, plus any additional variables that are present
+        in the original pandas DataFrame.
     """
+
+    # if type(scorers) is not list:
+    #     scorers = [scorers]
 
     if dim_reduction_list is None:
         dim_reduction_list = []
@@ -56,9 +64,10 @@ def gridsearch_results_to_xarray(df, dim_reduction_list=None, scorers=None):
     # ds = ds.rename(param_rename)
 
     for score in scorers:
-        list_splits = [datavar for datavar in ds.data_vars if 'split' in
-                       datavar and score in datavar]
-        var_splits = [split for split in ds.reset_coords()[list_splits].values()]
+        list_splits = [datavar for datavar in ds.data_vars if
+                       'split' in datavar and score in datavar]
+        var_splits = [split for split in
+                      ds.reset_coords()[list_splits].values()]
 
         ds['split_test_{}'.format(score)] = xr.DataArray(
             var_splits,
@@ -70,20 +79,10 @@ def gridsearch_results_to_xarray(df, dim_reduction_list=None, scorers=None):
         )
         ds = ds.drop(list_splits)
 
-    ''' Parameters that identify steps that are turned on or off can be
-    identified by not having a double-underscore. The data model from the
-    results dictionary has confusing logic that it is nan when it used and
-    "passthrough" when it not used. This creates two issues: (1) it is a
-    mixed data type that doesn't play well with conversions to better data
-    models like pandas and xarray. (2) a value of nan is not intuitive for a
-    True value.
-
-    Both of these issues are fixed below, but note it uses some janky logic
-    that may break.
-    '''
+    # Handle the "passthrough" variables.
     identifier_vars = [c for c in ds.coords if '__' not in c and 'param_' in c]
     for idv in identifier_vars:
-        ds[idv] = xr.where(ds[idv]=='passthrough', False, True)
+        ds[idv] = xr.where(ds[idv] == 'passthrough', False, True)
 
     # Variable indicating which dim reduction was used
     ds['dim_reduction'] = (('index'), dim_red_fill * len(ds['index']))
@@ -91,10 +90,11 @@ def gridsearch_results_to_xarray(df, dim_reduction_list=None, scorers=None):
     for dr in dim_reduction_list:
         if 'No dim reduction' not in dr:
             dim_red_param_name = 'param_' + dr
-            ds['dim_reduction'] = xr.where(ds[dim_red_param_name]==True, dr,
+            ds['dim_reduction'] = xr.where(ds[dim_red_param_name] == True, dr,
                                            ds['dim_reduction'])
 
-    # Handle the case with no dimensionality reduction
+    # Handle the case with no dimensionality reduction. This logic makes the function
+    # non-generalizable.
     ds['dim_reduction'] = xr.where(
         ds['dim_reduction'] == dim_red_fill,
         'No dim reduction',
@@ -105,8 +105,30 @@ def gridsearch_results_to_xarray(df, dim_reduction_list=None, scorers=None):
 
 
 def tat_evaluation_dataset(results, models_to_plot, rank_var=None):
-    """For the input models, select the best ranked configuration for each
-    and concatenate together.
+    """Select the best ranked models and concatenate together, keeping
+    only the relevant variables.
+
+    Used to provide data to seaborn that can be discriminated by a
+    `model, split` variable, where `model` is the model's identifier from
+    models_to_plot and `split` specifies if the point was from the training
+    or testing split.
+
+    Parameters
+    ----------
+    results : dict of xarray Datasets
+        Each item of the list corresponds to the saved results from the
+        grid search. See the model pipeline notebook for how these are created
+        and their contents.
+
+    rank_var : str, optional
+        Name of rank dimension to use for selecting the best model. By default
+        this should be R2, as stated in the model pipelinel. Should be the same
+        scoring variable used in the pipeline.
+
+    Returns
+    ----------
+    ds_combined : xarray Dataset
+        Concatenated model results.
     """
     if rank_var is None:
         rank_var = 'rank_test_R2'
@@ -149,6 +171,44 @@ def tat_evaluation_dataset(results, models_to_plot, rank_var=None):
 
 def tat_eval_scatterplot(results, models_to_plot, suptitle=None,
                          rank_var=None, fig_axes=None, sns_kwargs=None):
+    """Scatterplot of predicted vs observed and residuals. First plot is
+    predicted against observed target variable, second plot is residuals
+    as a function of observed target variable.
+
+    Parameters
+    ----------
+    results : dict of xarray Datasets
+        Each item ocorresponds to the saved results from the grid search.
+        Has the format from `gridsearch_results_to_xarray`. The keys are the
+        same as in models_to_plot.
+
+    models_to_plot : dict
+        Keys are model names, items are strings for labeling each model run in
+        a plot. The keys select for items in the results variable.
+
+
+    suptitle : str, optional.
+        Supertitle for the plot.
+
+    rank_var : str, optional
+        Name of rank dimension to use for selecting the best model. By default
+        this should be R2, as stated in the model pipelinel. Should be the same
+        scoring variable used in the pipeline.
+
+    fig_axes : tuple, optional
+        First item is the figure handle, second item is the axes handle. Otherwise.
+        the default figure size is (20, 10).
+
+    sns_kwargs : dict, optional
+        Keyword arguments for seaborn scatterplot.
+
+    Returns
+    ----------
+    ds_combined : xarray Dataset
+        Results from `tat_evaluation_dataset`
+
+    """
+
     if suptitle is None:
         suptitle = 'Predicted TATs from best estimator from GridSearchCV'
 
@@ -230,6 +290,32 @@ def tat_eval_scatterplot(results, models_to_plot, suptitle=None,
 
 
 def melt_model_results(results, models_to_plot, eval_vars=None):
+    """Melt the model and data splits. Converts a combined DataFrame
+    from long to short format for some plotting routines.
+
+    Applies pandas.melt (https://pandas.pydata.org/docs/reference/api/pandas.melt.html)
+
+    Parameters
+    ----------
+    results : dict of xarray Datasets
+        Each item ocorresponds to the saved results from the grid search.
+        Has the format from `gridsearch_results_to_xarray`. The keys are the
+        same as in models_to_plot.
+
+    models_to_plot : dict
+        Keys are model names, items are strings for labeling each model run in
+        a plot. The keys select for items in the results variable.
+
+    eval_vars : list of strings
+        The evaluation variables to combine into a long format DataFrame.
+
+    Returns
+    ----------
+    df_combined : pandas DataFrame
+        Concatenated model results in long format. The new variables are
+        model config, data split, and evaluation variables.
+    """
+
     ds_combined = tat_evaluation_dataset(results, models_to_plot)
     df = ds_combined.drop_dims('job')
 
@@ -279,6 +365,25 @@ def melt_model_results(results, models_to_plot, eval_vars=None):
 
 
 def barcharts(results, models_to_plot, suptitle=None, fig_axes=None):
+    """Plots the evaluation of the best model for the cross-validation
+    split, the testing split, and the training split.
+
+    Parameters
+    ----------
+    results : dict of xarray Datasets
+        Each item ocorresponds to the saved results from the grid search.
+        Has the format from `gridsearch_results_to_xarray`. The keys are the
+        same as in models_to_plot.
+
+    models_to_plot : dict
+        Keys are model names, items are strings for labeling each model run in
+        a plot. The keys select for items in the results variable.
+
+    Returns
+    ----------
+    df_combined : pandas DataFrame
+        Results from `melt_model_results`
+    """
     if suptitle is None:
         suptitle = 'Comparison of cross validation '
     df_combined = melt_model_results(results, models_to_plot, eval_vars=None)
@@ -312,6 +417,20 @@ def barcharts(results, models_to_plot, suptitle=None, fig_axes=None):
 
 
 def cv_splits(results, models_to_plot, rank_var=None, eval_vars=None):
+    """Plots the evaluation of the best model by cross-validation split.
+
+    Parameters
+    ----------
+    results : dict of xarray Datasets
+        Each item ocorresponds to the saved results from the grid search.
+        Has the format from `gridsearch_results_to_xarray`. The keys are the
+        same as in models_to_plot.
+
+    models_to_plot : dict
+        Keys are model names, items are strings for labeling each model run in
+        a plot. The keys select for items in the results variable.
+
+    """
     if rank_var is None:
         rank_var = 'rank_test_R2'
     if eval_vars is None:
